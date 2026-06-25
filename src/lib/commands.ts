@@ -93,7 +93,6 @@ async function handleAddExpense(
   let splits: { userLineId: string; userName: string; amount: number }[] = []
 
   if (isCustomSplit) {
-    // 小明:200 小花:300
     let total = 0
     for (const p of rest) {
       const colonIdx = p.lastIndexOf(':')
@@ -109,13 +108,11 @@ async function handleAddExpense(
       return `分攤金額加總 $${total} 與消費金額 $${amount} 不符，請確認`
     }
   } else if (isMentionSplit) {
-    // @小明 @小花 — equal split among mentioned only
     const names = rest.filter(p => p.startsWith('@')).map(p => p.slice(1))
     if (names.length === 0) return FORMAT_ERROR
     const share = Math.round(amount / names.length)
     splits = names.map(name => ({ userLineId: name, userName: name, amount: share }))
   } else {
-    // Equal split among all current trip members
     const { data: members } = await supabase
       .from('trip_members')
       .select('user_line_id, user_name')
@@ -200,7 +197,9 @@ async function handleMyBalance(
 
   for (const expense of expenses) {
     if (expense.payer_line_id === userId) paid += Number(expense.amount)
-    const mySplit = expense.expense_splits?.find((s: { user_line_id: string; amount: string }) => s.user_line_id === userId)
+    const mySplit = expense.expense_splits?.find(
+      (s: { user_line_id: string; amount: string }) => s.user_line_id === userId
+    )
     if (mySplit) shouldPay += Number(mySplit.amount)
   }
 
@@ -235,7 +234,13 @@ async function handleSettle(groupId: string): Promise<string> {
     description: e.description,
     splitType: e.split_type,
     createdAt: e.created_at,
-    splits: (e.expense_splits ?? []).map((s: { id: string; expense_id: string; user_line_id: string; user_name: string; amount: string }) => ({
+    splits: (e.expense_splits ?? []).map((s: {
+      id: string
+      expense_id: string
+      user_line_id: string
+      user_name: string
+      amount: string
+    }) => ({
       id: s.id,
       expenseId: s.expense_id,
       userLineId: s.user_line_id,
@@ -245,20 +250,27 @@ async function handleSettle(groupId: string): Promise<string> {
   }))
 
   const settlements = calculateSettlement(formatted)
+  const liffId = process.env.LIFF_ID
+  const liffLink = liffId ? `\n\n📊 查看完整明細\nhttps://liff.line.me/${liffId}/expense/${trip.id}` : ''
 
-  if (settlements.length === 0) return '✅ 大家都平衡了，不需要轉帳！'
+  if (settlements.length === 0) {
+    return `✅ 大家都平衡了，不需要轉帳！${liffLink}`
+  }
 
   const list = settlements
     .map(s => `💸 ${s.fromName} → ${s.toName} $${s.amount}`)
     .join('\n')
 
-  return `💰 結算結果\n旅程：${trip.name}\n\n${list}`
+  return `💰 結算結果\n旅程：${trip.name}\n\n${list}${liffLink}`
 }
 
 async function ensureMember(tripId: string, userId: string, userName: string) {
   await supabase
     .from('trip_members')
-    .upsert({ trip_id: tripId, user_line_id: userId, user_name: userName }, { onConflict: 'trip_id,user_line_id' })
+    .upsert(
+      { trip_id: tripId, user_line_id: userId, user_name: userName },
+      { onConflict: 'trip_id,user_line_id' }
+    )
 }
 
 const FORMAT_ERROR = `格式錯誤，請參考：
