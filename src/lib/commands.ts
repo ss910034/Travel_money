@@ -52,7 +52,22 @@ export async function handleCommand(ctx: CommandContext): Promise<BotReply | nul
     trimmed.match(/^(.+?)付了\s+(.+)$/)
 
   if (proxyMatch) {
-    return handleAddExpense({ groupId, userId, payerName: proxyMatch[1].trim(), raw: proxyMatch[2].trim(), isProxy: true, mentionees })
+    const rawPayerName = proxyMatch[1].trim()
+    // Strip leading @ if user @mentioned the payer in LINE
+    const payerName = rawPayerName.replace(/^@/, '')
+    // When payer was @mentioned, grab their real LINE userId from webhook mentionees
+    const payerUserId = rawPayerName.startsWith('@') && mentionees.length > 0
+      ? mentionees[0]
+      : undefined
+    return handleAddExpense({
+      groupId, userId,
+      payerName,
+      raw: proxyMatch[2].trim(),
+      isProxy: true,
+      // @mentions in proxy command identify the PAYER, not split targets
+      mentionees: [],
+      payerUserId,
+    })
   }
   if (trimmed.startsWith('新增旅程') || trimmed.startsWith('開始分帳')) {
     return handleNewTrip(groupId, userId, displayName, trimmed)
@@ -92,19 +107,30 @@ async function resolveNameToId(
   if (data && data.length === 1) {
     return { userId: data[0].user_line_id, userName: data[0].user_name }
   }
-  // Not found or ambiguous — use name as synthetic ID
   return { userId: `name:${name}`, userName: name }
 }
 
 // Resolve a LINE userId to display name from trip_members.
-async function resolveIdToName(tripId: string, userId: string): Promise<string> {
+// Falls back to LINE API if not synced yet, then to userId string.
+async function resolveIdToName(tripId: string, userId: string, groupId?: string): Promise<string> {
   const { data } = await supabase
     .from('trip_members')
     .select('user_name')
     .eq('trip_id', tripId)
     .eq('user_line_id', userId)
     .single()
-  return data?.user_name ?? userId
+  if (data?.user_name) return data.user_name
+
+  // Not in trip_members yet — try LINE API
+  if (groupId) {
+    const profile = await getGroupMemberProfile(groupId, userId)
+    if (profile?.displayName) {
+      // Save to trip_members so future lookups are instant
+      await ensureMember(tripId, userId, profile.displayName)
+      return profile.displayName
+    }
+  }
+  return userId
 }
 
 async function handleNewTrip(groupId: string, userId: string, displayName: string, text: string): Promise<BotReply> {
@@ -164,11 +190,12 @@ interface AddExpenseParams {
   payerName: string    // display name of payer
   raw: string          // text after command prefix
   isProxy: boolean
-  mentionees: string[] // ordered LINE userIds from @mentions
+  mentionees: string[] // ordered LINE userIds from @mentions (split targets only)
+  payerUserId?: string // pre-resolved payer LINE userId (from @mention in proxy cmd)
 }
 
 async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
-  const { groupId, userId, payerName, raw, isProxy, mentionees } = p
+  const { groupId, userId, payerName, raw, isProxy, mentionees, payerUserId } = p
   const trip = await getActiveTrip(groupId)
   if (!trip) return { text: '目前沒有進行中的旅程，請先輸入「新增旅程 旅程名稱」' }
 
@@ -200,9 +227,17 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
   let payerLineId: string
   let resolvedPayerName = payerName
   if (isProxy) {
-    const resolved = await resolveNameToId(trip.id, payerName)
-    payerLineId = resolved.userId
-    resolvedPayerName = resolved.userName
+    if (payerUserId) {
+      // Payer was @mentioned in the command — use their real LINE userId
+      payerLineId = payerUserId
+      const nameFromDb = await resolveIdToName(trip.id, payerUserId, groupId)
+      resolvedPayerName = nameFromDb !== payerUserId ? nameFromDb : payerName
+      await ensureMember(trip.id, payerUserId, resolvedPayerName)
+    } else {
+      const resolved = await resolveNameToId(trip.id, payerName)
+      payerLineId = resolved.userId
+      resolvedPayerName = resolved.userName
+    }
   } else {
     payerLineId = userId
     await ensureMember(trip.id, userId, payerName)
@@ -234,7 +269,7 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
       splits = await Promise.all(
         mentionees.map(async uid => ({
           userLineId: uid,
-          userName: await resolveIdToName(trip.id, uid),
+          userName: await resolveIdToName(trip.id, uid, groupId),
           amount: share,
         }))
       )
