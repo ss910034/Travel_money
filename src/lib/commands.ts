@@ -124,16 +124,17 @@ async function resolveIdToName(tripId: string, userId: string, groupId?: string)
   return userId
 }
 
+// Returns names that appear with more than one distinct id in the pairs list
 function buildDupeSet(pairs: Array<{ id: string; name: string }>): Set<string> {
-  const nameIds = new Map<string, Set<string>>()
-  for (const { id, name } of pairs) {
-    if (!nameIds.has(name)) nameIds.set(name, new Set())
-    nameIds.get(name)!.add(id)
-  }
+  const nameIds: Record<string, string[]> = {}
+  pairs.forEach(({ id, name }) => {
+    if (!nameIds[name]) nameIds[name] = []
+    if (nameIds[name].indexOf(id) === -1) nameIds[name].push(id)
+  })
   const dupes = new Set<string>()
-  for (const [name, ids] of nameIds) {
-    if (ids.size > 1) dupes.add(name)
-  }
+  Object.keys(nameIds).forEach(name => {
+    if (nameIds[name].length > 1) dupes.add(name)
+  })
   return dupes
 }
 
@@ -411,10 +412,11 @@ async function handleSettle(groupId: string): Promise<BotReply> {
     return { text: `✅ 大家都平衡了，不需要轉帳！${liffLink}`, quickReply: QR_AFTER_SETTLE }
   }
 
-  const settlePairs = settlements.flatMap(s => [
-    { id: s.from, name: s.fromName },
-    { id: s.to, name: s.toName },
-  ])
+  const settlePairs = settlements.reduce<Array<{ id: string; name: string }>>((acc, s) => {
+    acc.push({ id: s.from, name: s.fromName })
+    acc.push({ id: s.to, name: s.toName })
+    return acc
+  }, [])
   const dupeNames = buildDupeSet(settlePairs)
 
   const list = settlements.map(s =>
