@@ -1,5 +1,6 @@
 import { supabase } from './supabase'
 import { calculateSettlement } from './settlement'
+import { getGroupMemberIds, getGroupMemberProfile, getBotId } from './line'
 import type { Expense } from '@/types'
 
 interface CommandContext {
@@ -9,7 +10,41 @@ interface CommandContext {
   text: string
 }
 
-export async function handleCommand(ctx: CommandContext): Promise<string> {
+export interface QuickReplyItem {
+  label: string
+  text: string
+}
+
+export interface BotReply {
+  text: string
+  quickReply?: QuickReplyItem[]
+}
+
+const QR_MAIN: QuickReplyItem[] = [
+  { label: '📋 查帳', text: '查帳' },
+  { label: '👤 我的帳', text: '我的帳' },
+  { label: '🏦 結算', text: '結算' },
+  { label: '🗑 刪除最後一筆', text: '刪除最後一筆' },
+  { label: '🏁 結束旅程', text: '結束旅程' },
+  { label: '📖 幫助', text: '幫助' },
+]
+
+const QR_NEW_TRIP: QuickReplyItem[] = [
+  { label: '📋 查帳', text: '查帳' },
+  { label: '📖 幫助', text: '幫助' },
+]
+
+const QR_AFTER_SETTLE: QuickReplyItem[] = [
+  { label: '📋 查帳', text: '查帳' },
+  { label: '🏁 結束旅程', text: '結束旅程' },
+]
+
+const QR_NEW_AFTER_END: QuickReplyItem[] = [
+  { label: '🆕 新增旅程', text: '新增旅程 ' },
+  { label: '📖 幫助', text: '幫助' },
+]
+
+export async function handleCommand(ctx: CommandContext): Promise<BotReply | null> {
   const { groupId, userId, displayName, text } = ctx
   const trimmed = text.trim()
 
@@ -35,9 +70,9 @@ export async function handleCommand(ctx: CommandContext): Promise<string> {
     return handleDeleteLast(groupId)
   }
   if (trimmed === '幫助' || trimmed === 'help' || trimmed === '說明') {
-    return HELP_TEXT
+    return { text: HELP_TEXT, quickReply: QR_MAIN }
   }
-  return ''
+  return null
 }
 
 async function getActiveTrip(groupId: string) {
@@ -57,9 +92,9 @@ async function handleNewTrip(
   userId: string,
   displayName: string,
   text: string
-): Promise<string> {
+): Promise<BotReply> {
   const name = text.replace(/^(新增旅程|開始分帳)\s*/, '').trim()
-  if (!name) return '請輸入旅程名稱，例如：新增旅程 沖繩五天'
+  if (!name) return { text: '請輸入旅程名稱，例如：新增旅程 沖繩五天' }
 
   const { data, error } = await supabase
     .from('trips')
@@ -67,10 +102,30 @@ async function handleNewTrip(
     .select()
     .single()
 
-  if (error || !data) return '建立旅程失敗，請稍後再試'
+  if (error || !data) return { text: '建立旅程失敗，請稍後再試' }
 
-  await ensureMember(data.id, userId, displayName)
-  return `✅ 已建立旅程：${data.name}\n\n輸入「記帳 金額 說明」來新增消費\n輸入「幫助」查看所有指令`
+  // Sync all group members in background (don't await, avoid timeout)
+  syncGroupMembers(groupId, data.id).catch(() => null)
+
+  return {
+    text: `✅ 已建立旅程：${data.name}\n👥 正在同步群組成員...\n\n輸入「記帳 金額 說明」來新增消費`,
+    quickReply: QR_NEW_TRIP,
+  }
+}
+
+async function syncGroupMembers(groupId: string, tripId: string) {
+  const botId = await getBotId()
+  const memberIds = await getGroupMemberIds(groupId)
+
+  for (const memberId of memberIds) {
+    if (memberId === botId) continue // skip the bot itself
+    const profile = await getGroupMemberProfile(groupId, memberId)
+    if (!profile) continue
+    await supabase.from('trip_members').upsert(
+      { trip_id: tripId, user_line_id: memberId, user_name: profile.displayName },
+      { onConflict: 'trip_id,user_line_id' }
+    )
+  }
 }
 
 async function handleAddExpense(
@@ -78,16 +133,16 @@ async function handleAddExpense(
   userId: string,
   displayName: string,
   text: string
-): Promise<string> {
+): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程，請先輸入「新增旅程 旅程名稱」'
+  if (!trip) return { text: '目前沒有進行中的旅程，請先輸入「新增旅程 旅程名稱」' }
 
   const raw = text.replace(/^(記帳|新增消費)\s*/, '').trim()
   const parts = raw.split(/\s+/)
-  if (parts.length < 2) return FORMAT_ERROR
+  if (parts.length < 2) return { text: FORMAT_ERROR }
 
   const amount = parseFloat(parts[0])
-  if (isNaN(amount) || amount <= 0) return '金額格式錯誤，請輸入正確數字'
+  if (isNaN(amount) || amount <= 0) return { text: '金額格式錯誤，請輸入正確數字' }
 
   const description = parts[1]
   const rest = parts.slice(2)
@@ -109,13 +164,13 @@ async function handleAddExpense(
       splits.push({ userLineId: name, userName: name, amount: amt })
       total += amt
     }
-    if (splits.length === 0) return FORMAT_ERROR
+    if (splits.length === 0) return { text: FORMAT_ERROR }
     if (Math.abs(total - amount) > 0.5) {
-      return `分攤金額加總 $${total} 與消費金額 $${amount} 不符，請確認`
+      return { text: `分攤金額加總 $${total} 與消費金額 $${amount} 不符，請確認` }
     }
   } else if (isMentionSplit) {
     const names = rest.filter(p => p.startsWith('@')).map(p => p.slice(1))
-    if (names.length === 0) return FORMAT_ERROR
+    if (names.length === 0) return { text: FORMAT_ERROR }
     const share = Math.round(amount / names.length)
     splits = names.map(name => ({ userLineId: name, userName: name, amount: share }))
   } else {
@@ -124,7 +179,7 @@ async function handleAddExpense(
       .select('user_line_id, user_name')
       .eq('trip_id', trip.id)
 
-    const memberList = members ?? [{ user_line_id: userId, user_name: displayName }]
+    const memberList = members?.length ? members : [{ user_line_id: userId, user_name: displayName }]
     const share = Math.round(amount / memberList.length)
     splits = memberList.map(m => ({
       userLineId: m.user_line_id,
@@ -146,7 +201,7 @@ async function handleAddExpense(
     .select()
     .single()
 
-  if (error || !expense) return '記帳失敗，請稍後再試'
+  if (error || !expense) return { text: '記帳失敗，請稍後再試' }
 
   await supabase.from('expense_splits').insert(
     splits.map(s => ({
@@ -158,12 +213,15 @@ async function handleAddExpense(
   )
 
   const splitSummary = splits.map(s => `  ${s.userName} $${s.amount}`).join('\n')
-  return `✅ 已記錄消費\n💰 ${displayName} 付了 $${amount}（${description}）\n\n分攤：\n${splitSummary}`
+  return {
+    text: `✅ 已記錄消費\n💰 ${displayName} 付了 $${amount}（${description}）\n\n分攤：\n${splitSummary}`,
+    quickReply: QR_MAIN,
+  }
 }
 
-async function handleListExpenses(groupId: string): Promise<string> {
+async function handleListExpenses(groupId: string): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程'
+  if (!trip) return { text: '目前沒有進行中的旅程' }
 
   const { data: expenses } = await supabase
     .from('expenses')
@@ -171,23 +229,28 @@ async function handleListExpenses(groupId: string): Promise<string> {
     .eq('trip_id', trip.id)
     .order('created_at', { ascending: true })
 
-  if (!expenses || expenses.length === 0) return `旅程「${trip.name}」尚無消費紀錄`
+  if (!expenses || expenses.length === 0) {
+    return { text: `旅程「${trip.name}」尚無消費紀錄`, quickReply: QR_MAIN }
+  }
 
   const total = expenses.reduce((sum, e) => sum + Number(e.amount), 0)
   const list = expenses
     .map((e, i) => `${i + 1}. ${e.payer_name} 付 $${e.amount}（${e.description}）`)
     .join('\n')
 
-  return `📋 旅程：${trip.name}\n\n${list}\n\n合計：$${total}`
+  return {
+    text: `📋 旅程：${trip.name}\n\n${list}\n\n合計：$${total}`,
+    quickReply: QR_MAIN,
+  }
 }
 
 async function handleMyBalance(
   groupId: string,
   userId: string,
   displayName: string
-): Promise<string> {
+): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程'
+  if (!trip) return { text: '目前沒有進行中的旅程' }
 
   await ensureMember(trip.id, userId, displayName)
 
@@ -196,7 +259,9 @@ async function handleMyBalance(
     .select('*, expense_splits(*)')
     .eq('trip_id', trip.id)
 
-  if (!expenses || expenses.length === 0) return '尚無消費紀錄'
+  if (!expenses || expenses.length === 0) {
+    return { text: '尚無消費紀錄', quickReply: QR_MAIN }
+  }
 
   let paid = 0
   let shouldPay = 0
@@ -217,19 +282,24 @@ async function handleMyBalance(
       ? `你欠別人 $${Math.round(Math.abs(balance))}`
       : '剛好平衡 👍'
 
-  return `👤 ${displayName} 的帳\n\n已付：$${paid}\n應付：$${shouldPay}\n餘額：${status}`
+  return {
+    text: `👤 ${displayName} 的帳\n\n已付：$${paid}\n應付：$${shouldPay}\n餘額：${status}`,
+    quickReply: QR_MAIN,
+  }
 }
 
-async function handleSettle(groupId: string): Promise<string> {
+async function handleSettle(groupId: string): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程'
+  if (!trip) return { text: '目前沒有進行中的旅程' }
 
   const { data: expenses } = await supabase
     .from('expenses')
     .select('*, expense_splits(*)')
     .eq('trip_id', trip.id)
 
-  if (!expenses || expenses.length === 0) return '尚無消費紀錄'
+  if (!expenses || expenses.length === 0) {
+    return { text: '尚無消費紀錄', quickReply: QR_MAIN }
+  }
 
   const formatted: Expense[] = expenses.map(e => ({
     id: e.id,
@@ -241,11 +311,7 @@ async function handleSettle(groupId: string): Promise<string> {
     splitType: e.split_type,
     createdAt: e.created_at,
     splits: (e.expense_splits ?? []).map((s: {
-      id: string
-      expense_id: string
-      user_line_id: string
-      user_name: string
-      amount: string
+      id: string; expense_id: string; user_line_id: string; user_name: string; amount: string
     }) => ({
       id: s.id,
       expenseId: s.expense_id,
@@ -257,36 +323,44 @@ async function handleSettle(groupId: string): Promise<string> {
 
   const settlements = calculateSettlement(formatted)
   const liffId = process.env.LIFF_ID
-  const liffLink = liffId ? `\n\n📊 查看完整明細\nhttps://liff.line.me/${liffId}/expense/${trip.id}` : ''
+  const liffLink = liffId
+    ? `\n\n📊 查看完整明細\nhttps://liff.line.me/${liffId}/expense/${trip.id}`
+    : ''
 
   if (settlements.length === 0) {
-    return `✅ 大家都平衡了，不需要轉帳！${liffLink}`
+    return {
+      text: `✅ 大家都平衡了，不需要轉帳！${liffLink}`,
+      quickReply: QR_AFTER_SETTLE,
+    }
   }
 
-  const list = settlements
-    .map(s => `💸 ${s.fromName} → ${s.toName} $${s.amount}`)
-    .join('\n')
-
-  return `💰 結算結果\n旅程：${trip.name}\n\n${list}${liffLink}`
+  const list = settlements.map(s => `💸 ${s.fromName} → ${s.toName} $${s.amount}`).join('\n')
+  return {
+    text: `💰 結算結果\n旅程：${trip.name}\n\n${list}${liffLink}`,
+    quickReply: QR_AFTER_SETTLE,
+  }
 }
 
-async function handleEndTrip(groupId: string): Promise<string> {
+async function handleEndTrip(groupId: string): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程'
+  if (!trip) return { text: '目前沒有進行中的旅程' }
 
   const { error } = await supabase
     .from('trips')
     .update({ status: 'settled' })
     .eq('id', trip.id)
 
-  if (error) return '結束旅程失敗，請稍後再試'
+  if (error) return { text: '結束旅程失敗，請稍後再試' }
 
-  return `🏁 旅程「${trip.name}」已結束\n\n輸入「新增旅程 名稱」可以開始新的分帳`
+  return {
+    text: `🏁 旅程「${trip.name}」已結束\n\n輸入「新增旅程 名稱」可以開始新的分帳`,
+    quickReply: QR_NEW_AFTER_END,
+  }
 }
 
-async function handleDeleteLast(groupId: string): Promise<string> {
+async function handleDeleteLast(groupId: string): Promise<BotReply> {
   const trip = await getActiveTrip(groupId)
-  if (!trip) return '目前沒有進行中的旅程'
+  if (!trip) return { text: '目前沒有進行中的旅程' }
 
   const { data: last, error: fetchError } = await supabase
     .from('expenses')
@@ -296,16 +370,16 @@ async function handleDeleteLast(groupId: string): Promise<string> {
     .limit(1)
     .single()
 
-  if (fetchError || !last) return '目前沒有可删除的消費紀錄'
+  if (fetchError || !last) return { text: '目前沒有可删除的消費紀錄' }
 
-  const { error } = await supabase
-    .from('expenses')
-    .delete()
-    .eq('id', last.id)
+  const { error } = await supabase.from('expenses').delete().eq('id', last.id)
 
-  if (error) return '删除失敗，請稍後再試'
+  if (error) return { text: '删除失敗，請稍後再試' }
 
-  return `🗑 已删除最後一筆\n${last.payer_name} 付 $${last.amount}（${last.description}）`
+  return {
+    text: `🗑 已删除最後一筆\n${last.payer_name} 付 $${last.amount}（${last.description}）`,
+    quickReply: QR_MAIN,
+  }
 }
 
 async function ensureMember(tripId: string, userId: string, userName: string) {
@@ -318,26 +392,18 @@ async function ensureMember(tripId: string, userId: string, userName: string) {
 }
 
 const FORMAT_ERROR = `格式錯誤，請參考：
-• 記帳 500 晚餐（均剆所有成員）
+• 記帳 500 晚餐（均分所有成員）
 • 記帳 600 計程車 @小明 @小花（指定均分）
 • 記帳 900 午餐 小明:400 小花:500（自訂金額）`
 
 const HELP_TEXT = `📖 分帳機器人指令
 
 🆕 新增旅程 [名稱]
-   例：新增旅程 沖繩五天
-
 💰 記帳 [金額] [說明]
-   例：記帳 1200 晚餐
-
-   指定分攤人（均分）：
-   記帳 600 計程車 @小明 @小花
-
-   自訂金額（不均分）：
-   記帳 900 午餐 小明:400 小花:500
-
-📋 查帳 — 查看所有消費
-👤 我的帳 — 查看個人餘額
-🏦 結算 — 計算最少轉帳方案
-🏁 結束旅程 — 結束目前旅程，可開新旅程
-🗑 刪除最後一筆 — 刪除最新一筆記帳`
+   指定則：記帳 600 計程車 @A @B
+   自訂：記帳 900 午餐 A:400 B:500
+📋 查帳
+👤 我的帳
+🏦 結算
+🏁 結束旅程
+🗑 刪除最後一筆`

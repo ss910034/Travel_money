@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import crypto from 'crypto'
 import { handleCommand } from '@/lib/commands'
+import type { QuickReplyItem } from '@/lib/commands'
 
 export async function POST(req: NextRequest) {
   const body = await req.text()
@@ -26,23 +27,39 @@ export async function POST(req: NextRequest) {
 
     const reply = await handleCommand({ groupId, userId, displayName, text })
     if (reply) {
-      await replyMessage(event.replyToken, reply)
+      await replyMessage(event.replyToken, reply.text, reply.quickReply)
     }
   }
 
   return NextResponse.json({ ok: true })
 }
 
-async function replyMessage(replyToken: string, text: string) {
+async function replyMessage(
+  replyToken: string,
+  text: string,
+  quickReplyItems?: QuickReplyItem[]
+) {
+  const message: Record<string, unknown> = { type: 'text', text }
+
+  if (quickReplyItems && quickReplyItems.length > 0) {
+    message.quickReply = {
+      items: quickReplyItems.map(item => ({
+        type: 'action',
+        action: {
+          type: 'message',
+          label: item.label,
+          text: item.text,
+        },
+      })),
+    }
+  }
+
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: 'text', text }],
-    }),
+    body: JSON.stringify({ replyToken, messages: [message] }),
   })
 }
