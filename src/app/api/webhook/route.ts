@@ -25,11 +25,16 @@ export async function POST(req: NextRequest) {
     const userId: string = event.source.userId
     const text: string = event.message.text
 
-    // Fetch real display name from LINE API
+    // Extract ordered mentionee user IDs from the message
+    const mentionees: string[] = (event.message.mention?.mentionees ?? [])
+      .filter((m: { type: string }) => m.type === 'user')
+      .sort((a: { index: number }, b: { index: number }) => a.index - b.index)
+      .map((m: { userId: string }) => m.userId)
+
     const profile = await getGroupMemberProfile(groupId, userId)
     const displayName: string = profile?.displayName ?? userId
 
-    const reply = await handleCommand({ groupId, userId, displayName, text })
+    const reply = await handleCommand({ groupId, userId, displayName, text, mentionees })
     if (reply) {
       await replyMessage(event.replyToken, reply.text, reply.quickReply)
     }
@@ -49,11 +54,7 @@ async function replyMessage(
     message.quickReply = {
       items: quickReplyItems.map(item => ({
         type: 'action',
-        action: {
-          type: 'message',
-          label: item.label,
-          text: item.text,
-        },
+        action: { type: 'message', label: item.label, text: item.text },
       })),
     }
   }
