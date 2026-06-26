@@ -124,15 +124,14 @@ async function resolveIdToName(tripId: string, userId: string, groupId?: string)
   return userId
 }
 
-// Returns names that appear with more than one distinct id in the pairs list
 function buildDupeSet(pairs: Array<{ id: string; name: string }>): Set<string> {
   const nameIds: Record<string, string[]> = {}
-  pairs.forEach(({ id, name }) => {
+  pairs.forEach(function({ id, name }) {
     if (!nameIds[name]) nameIds[name] = []
     if (nameIds[name].indexOf(id) === -1) nameIds[name].push(id)
   })
   const dupes = new Set<string>()
-  Object.keys(nameIds).forEach(name => {
+  Object.keys(nameIds).forEach(function(name) {
     if (nameIds[name].length > 1) dupes.add(name)
   })
   return dupes
@@ -161,6 +160,7 @@ async function handleNewTrip(groupId: string, userId: string, displayName: strin
 
   if (error || !data) return { text: '建立旅程失敗，請稍後再試' }
 
+  // Run sync in background so trip creation response is fast
   syncGroupMembers(groupId, data.id).catch(() => null)
 
   const currencyNote = currency !== 'TWD' ? `\n💱 預設貨幣：${currency}（結算自動換算為 TWD）` : ''
@@ -201,6 +201,17 @@ interface AddExpenseParams {
   isProxy: boolean
   mentionees: string[]
   payerUserId?: string
+}
+
+async function getTripMembers(tripId: string, groupId: string) {
+  const { data } = await supabase
+    .from('trip_members').select('user_line_id, user_name').eq('trip_id', tripId)
+  if (data && data.length > 0) return data
+  // Background sync hasn't finished yet — run inline now
+  await syncGroupMembers(groupId, tripId)
+  const fresh = await supabase
+    .from('trip_members').select('user_line_id, user_name').eq('trip_id', tripId)
+  return fresh.data ?? []
 }
 
 async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
@@ -289,9 +300,9 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
       )
     }
   } else {
-    const { data: members } = await supabase
-      .from('trip_members').select('user_line_id, user_name').eq('trip_id', trip.id)
-    const memberList = members?.length
+    // Equal split among all members; sync inline if DB is still empty
+    const members = await getTripMembers(trip.id, groupId)
+    const memberList = members.length > 0
       ? members
       : [{ user_line_id: payerLineId, user_name: resolvedPayerName }]
     const share = Math.round(twd / memberList.length)
