@@ -28,6 +28,12 @@ export async function handleCommand(ctx: CommandContext): Promise<string> {
   if (trimmed === '結算') {
     return handleSettle(groupId)
   }
+  if (trimmed === '結束旅程' || trimmed === '重置') {
+    return handleEndTrip(groupId)
+  }
+  if (trimmed === '刪除最後一筆' || trimmed === '刲除') {
+    return handleDeleteLast(groupId)
+  }
   if (trimmed === '幫助' || trimmed === 'help' || trimmed === '說明') {
     return HELP_TEXT
   }
@@ -264,6 +270,44 @@ async function handleSettle(groupId: string): Promise<string> {
   return `💰 結算結果\n旅程：${trip.name}\n\n${list}${liffLink}`
 }
 
+async function handleEndTrip(groupId: string): Promise<string> {
+  const trip = await getActiveTrip(groupId)
+  if (!trip) return '目前沒有進行中的旅程'
+
+  const { error } = await supabase
+    .from('trips')
+    .update({ status: 'settled' })
+    .eq('id', trip.id)
+
+  if (error) return '結束旅程失敗，請稍後再試'
+
+  return `🏁 旅程「${trip.name}」已結束\n\n輸入「新增旅程 名稱」可以開始新的分帳`
+}
+
+async function handleDeleteLast(groupId: string): Promise<string> {
+  const trip = await getActiveTrip(groupId)
+  if (!trip) return '目前沒有進行中的旅程'
+
+  const { data: last, error: fetchError } = await supabase
+    .from('expenses')
+    .select('*')
+    .eq('trip_id', trip.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single()
+
+  if (fetchError || !last) return '目前沒有可删除的消費紀錄'
+
+  const { error } = await supabase
+    .from('expenses')
+    .delete()
+    .eq('id', last.id)
+
+  if (error) return '删除失敗，請稍後再試'
+
+  return `🗑 已删除最後一筆\n${last.payer_name} 付 $${last.amount}（${last.description}）`
+}
+
 async function ensureMember(tripId: string, userId: string, userName: string) {
   await supabase
     .from('trip_members')
@@ -274,7 +318,7 @@ async function ensureMember(tripId: string, userId: string, userName: string) {
 }
 
 const FORMAT_ERROR = `格式錯誤，請參考：
-• 記帳 500 晚餐（均分所有成員）
+• 記帳 500 晚餐（均剆所有成員）
 • 記帳 600 計程車 @小明 @小花（指定均分）
 • 記帳 900 午餐 小明:400 小花:500（自訂金額）`
 
@@ -294,4 +338,6 @@ const HELP_TEXT = `📖 分帳機器人指令
 
 📋 查帳 — 查看所有消費
 👤 我的帳 — 查看個人餘額
-🏦 結算 — 計算最少轉帳方案`
+🏦 結算 — 計算最少轉帳方案
+🏁 結束旅程 — 結束目前旅程，可開新旅程
+🗑 刪除最後一筆 — 刪除最新一筆記帳`
