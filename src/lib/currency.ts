@@ -18,12 +18,15 @@ export async function convertToTWD(amount: number, from: string): Promise<{ twd:
 
   try {
     const res = await fetch(
-      `https://api.frankfurter.app/latest?amount=${amount}&from=${from.toUpperCase()}&to=TWD`
+      `https://api.exchangerate-api.com/v4/latest/${from.toUpperCase()}`
     )
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    const twd = Math.round(data.rates?.TWD ?? amount)
-    const rate = Math.round((twd / amount) * 1000) / 1000
-    return { twd, rate }
+    const rate: number | undefined = data.rates?.TWD
+    if (!rate) throw new Error('TWD rate not found')
+    const twd = Math.round(amount * rate)
+    const roundedRate = Math.round(rate * 1000) / 1000
+    return { twd, rate: roundedRate }
   } catch {
     return { twd: amount, rate: 1 }
   }
