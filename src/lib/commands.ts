@@ -9,7 +9,7 @@ interface CommandContext {
   userId: string
   displayName: string
   text: string
-  mentionees: string[] // ordered LINE userIds of @mentioned users
+  mentionees: string[]
 }
 
 export interface QuickReplyItem {
@@ -124,7 +124,19 @@ async function resolveIdToName(tripId: string, userId: string, groupId?: string)
   return userId
 }
 
-// Returns a display label — appends last-4 of LINE ID when the name is shared
+function buildDupeSet(pairs: Array<{ id: string; name: string }>): Set<string> {
+  const nameIds = new Map<string, Set<string>>()
+  for (const { id, name } of pairs) {
+    if (!nameIds.has(name)) nameIds.set(name, new Set())
+    nameIds.get(name)!.add(id)
+  }
+  const dupes = new Set<string>()
+  for (const [name, ids] of nameIds) {
+    if (ids.size > 1) dupes.add(name)
+  }
+  return dupes
+}
+
 function tagName(id: string, name: string, dupes: Set<string>): string {
   return dupes.has(name) ? `${name}(…${id.slice(-4)})` : name
 }
@@ -310,10 +322,7 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
     }))
   )
 
-  // Disambiguate same display names in split summary
-  const splitNameCount = new Map<string, number>()
-  for (const s of splits) splitNameCount.set(s.userName, (splitNameCount.get(s.userName) ?? 0) + 1)
-  const dupeNames = new Set([...splitNameCount.entries()].filter(([, c]) => c > 1).map(([n]) => n))
+  const dupeNames = buildDupeSet(splits.map(s => ({ id: s.userLineId, name: s.userName })))
   const splitSummary = splits.map(s => `  ${tagName(s.userLineId, s.userName, dupeNames)} $${s.amount}`).join('\n')
 
   const payerLabel = isProxy ? `代為 ${resolvedPayerName} 記帳` : `${resolvedPayerName} 付了`
@@ -402,15 +411,11 @@ async function handleSettle(groupId: string): Promise<BotReply> {
     return { text: `✅ 大家都平衡了，不需要轉帳！${liffLink}`, quickReply: QR_AFTER_SETTLE }
   }
 
-  // Collect all name→id mappings to detect duplicates
-  const nameIds = new Map<string, Set<string>>()
-  for (const s of settlements) {
-    if (!nameIds.has(s.fromName)) nameIds.set(s.fromName, new Set())
-    nameIds.get(s.fromName)!.add(s.from)
-    if (!nameIds.has(s.toName)) nameIds.set(s.toName, new Set())
-    nameIds.get(s.toName)!.add(s.to)
-  }
-  const dupeNames = new Set([...nameIds.entries()].filter(([, ids]) => ids.size > 1).map(([n]) => n))
+  const settlePairs = settlements.flatMap(s => [
+    { id: s.from, name: s.fromName },
+    { id: s.to, name: s.toName },
+  ])
+  const dupeNames = buildDupeSet(settlePairs)
 
   const list = settlements.map(s =>
     `💸 ${tagName(s.from, s.fromName, dupeNames)} → ${tagName(s.to, s.toName, dupeNames)} $${s.amount} TWD`
