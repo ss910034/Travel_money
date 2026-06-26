@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import crypto from 'crypto'
 import { handleCommand } from '@/lib/commands'
+import { getGroupMemberProfile } from '@/lib/line'
 import type { QuickReplyItem } from '@/lib/commands'
 
 export async function POST(req: NextRequest) {
@@ -23,7 +24,10 @@ export async function POST(req: NextRequest) {
     const groupId: string = event.source.groupId
     const userId: string = event.source.userId
     const text: string = event.message.text
-    const displayName: string = userId
+
+    // Fetch real display name from LINE API
+    const profile = await getGroupMemberProfile(groupId, userId)
+    const displayName: string = profile?.displayName ?? userId
 
     const reply = await handleCommand({ groupId, userId, displayName, text })
     if (reply) {
