@@ -53,9 +53,7 @@ export async function handleCommand(ctx: CommandContext): Promise<BotReply | nul
 
   if (proxyMatch) {
     const rawPayerName = proxyMatch[1].trim()
-    // Strip leading @ if user @mentioned the payer in LINE
     const payerName = rawPayerName.replace(/^@/, '')
-    // When payer was @mentioned, grab their real LINE userId from webhook mentionees
     const payerUserId = rawPayerName.startsWith('@') && mentionees.length > 0
       ? mentionees[0]
       : undefined
@@ -64,7 +62,6 @@ export async function handleCommand(ctx: CommandContext): Promise<BotReply | nul
       payerName,
       raw: proxyMatch[2].trim(),
       isProxy: true,
-      // @mentions in proxy command identify the PAYER, not split targets
       mentionees: [],
       payerUserId,
     })
@@ -92,8 +89,6 @@ async function getActiveTrip(groupId: string) {
   return data
 }
 
-// Resolve a display name to a stable user ID using trip_members.
-// Falls back to name:<name> if not found or ambiguous.
 async function resolveNameToId(
   tripId: string,
   name: string
@@ -110,8 +105,6 @@ async function resolveNameToId(
   return { userId: `name:${name}`, userName: name }
 }
 
-// Resolve a LINE userId to display name from trip_members.
-// Falls back to LINE API if not synced yet, then to userId string.
 async function resolveIdToName(tripId: string, userId: string, groupId?: string): Promise<string> {
   const { data } = await supabase
     .from('trip_members')
@@ -121,16 +114,19 @@ async function resolveIdToName(tripId: string, userId: string, groupId?: string)
     .single()
   if (data?.user_name) return data.user_name
 
-  // Not in trip_members yet — try LINE API
   if (groupId) {
     const profile = await getGroupMemberProfile(groupId, userId)
     if (profile?.displayName) {
-      // Save to trip_members so future lookups are instant
       await ensureMember(tripId, userId, profile.displayName)
       return profile.displayName
     }
   }
   return userId
+}
+
+// Returns a display label — appends last-4 of LINE ID when the name is shared
+function tagName(id: string, name: string, dupes: Set<string>): string {
+  return dupes.has(name) ? `${name}(…${id.slice(-4)})` : name
 }
 
 async function handleNewTrip(groupId: string, userId: string, displayName: string, text: string): Promise<BotReply> {
@@ -186,12 +182,12 @@ async function syncGroupMembers(groupId: string, tripId: string) {
 
 interface AddExpenseParams {
   groupId: string
-  userId: string       // sender's LINE userId (always the actual sender)
-  payerName: string    // display name of payer
-  raw: string          // text after command prefix
+  userId: string
+  payerName: string
+  raw: string
   isProxy: boolean
-  mentionees: string[] // ordered LINE userIds from @mentions (split targets only)
-  payerUserId?: string // pre-resolved payer LINE userId (from @mention in proxy cmd)
+  mentionees: string[]
+  payerUserId?: string
 }
 
 async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
@@ -223,12 +219,10 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
     ? `\n   ${currencySymbol(inputCurrency)}${amount} ≈ $${twd} TWD（匯率 ${rate}）`
     : ''
 
-  // Resolve payer to a stable ID
   let payerLineId: string
   let resolvedPayerName = payerName
   if (isProxy) {
     if (payerUserId) {
-      // Payer was @mentioned in the command — use their real LINE userId
       payerLineId = payerUserId
       const nameFromDb = await resolveIdToName(trip.id, payerUserId, groupId)
       resolvedPayerName = nameFromDb !== payerUserId ? nameFromDb : payerName
@@ -246,7 +240,6 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
   let splits: { userLineId: string; userName: string; amount: number }[] = []
 
   if (isCustomSplit) {
-    // 小明:400 小花:500 — resolve names to IDs via trip_members
     let total = 0
     for (const part of rest) {
       const colonIdx = part.lastIndexOf(':')
@@ -263,7 +256,6 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
       return { text: `分攤金額加總 $${total} 與消費 $${twd} TWD 不符，請確認` }
     }
   } else if (isMentionSplit) {
-    // Use real LINE userIds from webhook mention payload
     if (mentionees.length > 0) {
       const share = Math.round(twd / mentionees.length)
       splits = await Promise.all(
@@ -274,7 +266,6 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
         }))
       )
     } else {
-      // Fallback: parse @name text, resolve via trip_members
       const names = rest.filter(p => p.startsWith('@')).map(p => p.slice(1))
       const share = Math.round(twd / names.length)
       splits = await Promise.all(
@@ -285,7 +276,6 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
       )
     }
   } else {
-    // Equal split among all trip members
     const { data: members } = await supabase
       .from('trip_members').select('user_line_id, user_name').eq('trip_id', trip.id)
     const memberList = members?.length
@@ -320,7 +310,12 @@ async function handleAddExpense(p: AddExpenseParams): Promise<BotReply> {
     }))
   )
 
-  const splitSummary = splits.map(s => `  ${s.userName} $${s.amount}`).join('\n')
+  // Disambiguate same display names in split summary
+  const splitNameCount = new Map<string, number>()
+  for (const s of splits) splitNameCount.set(s.userName, (splitNameCount.get(s.userName) ?? 0) + 1)
+  const dupeNames = new Set([...splitNameCount.entries()].filter(([, c]) => c > 1).map(([n]) => n))
+  const splitSummary = splits.map(s => `  ${tagName(s.userLineId, s.userName, dupeNames)} $${s.amount}`).join('\n')
+
   const payerLabel = isProxy ? `代為 ${resolvedPayerName} 記帳` : `${resolvedPayerName} 付了`
   return {
     text: `✅ 已記錄消費\n💰 ${payerLabel} ${currencySymbol(inputCurrency)}${amount}（${description}）${conversionNote}\n\n分攤（TWD）：\n${splitSummary}`,
@@ -407,7 +402,20 @@ async function handleSettle(groupId: string): Promise<BotReply> {
     return { text: `✅ 大家都平衡了，不需要轉帳！${liffLink}`, quickReply: QR_AFTER_SETTLE }
   }
 
-  const list = settlements.map(s => `💸 ${s.fromName} → ${s.toName} $${s.amount} TWD`).join('\n')
+  // Collect all name→id mappings to detect duplicates
+  const nameIds = new Map<string, Set<string>>()
+  for (const s of settlements) {
+    if (!nameIds.has(s.fromName)) nameIds.set(s.fromName, new Set())
+    nameIds.get(s.fromName)!.add(s.from)
+    if (!nameIds.has(s.toName)) nameIds.set(s.toName, new Set())
+    nameIds.get(s.toName)!.add(s.to)
+  }
+  const dupeNames = new Set([...nameIds.entries()].filter(([, ids]) => ids.size > 1).map(([n]) => n))
+
+  const list = settlements.map(s =>
+    `💸 ${tagName(s.from, s.fromName, dupeNames)} → ${tagName(s.to, s.toName, dupeNames)} $${s.amount} TWD`
+  ).join('\n')
+
   return {
     text: `💰 結算結果\n旅程：${trip.name}\n\n${list}${liffLink}`,
     quickReply: QR_AFTER_SETTLE,
