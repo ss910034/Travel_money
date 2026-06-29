@@ -31,6 +31,7 @@ const QR_MAIN: QuickReplyItem[] = [
   { label: '📖 幫助', text: '幫助' },
 ]
 const QR_NEW_TRIP: QuickReplyItem[] = [
+  { label: '👥 成員', text: '成員 ' },
   { label: '📋 查帳', text: '查帳' },
   { label: '📖 幫助', text: '幫助' },
 ]
@@ -67,7 +68,10 @@ export async function handleCommand(ctx: CommandContext): Promise<BotReply | nul
     })
   }
   if (trimmed.startsWith('新增旅程') || trimmed.startsWith('開始分帳')) {
-    return handleNewTrip(groupId, userId, displayName, trimmed)
+    return handleNewTrip(groupId, userId, displayName, trimmed, mentionees)
+  }
+  if (trimmed.startsWith('成員') || trimmed.startsWith('新增成員')) {
+    return handleAddMembers(groupId, mentionees)
   }
   if (trimmed.startsWith('記帳') || trimmed.startsWith('新增消費')) {
     return handleAddExpense({ groupId, userId, payerName: displayName, raw: trimmed.replace(/^(記帳|新增消費)\s*/, ''), isProxy: false, mentionees })
@@ -141,17 +145,40 @@ function tagName(id: string, name: string, dupes: Set<string>): string {
   return dupes.has(name) ? `${name}(…${id.slice(-4)})` : name
 }
 
-async function handleNewTrip(groupId: string, userId: string, displayName: string, text: string): Promise<BotReply> {
-  const raw = text.replace(/^(新增旅程|開始分帳)\s*/, '').trim()
-  if (!raw) return { text: '請輸入旅程名稱，例如：新增旅程 沖繩五天' }
-
-  const parts = raw.split(/\s+/)
-  const lastPart = parts[parts.length - 1].toUpperCase()
-  let currency = 'TWD', name = raw
-  if (isCurrency(lastPart) && parts.length > 1) {
-    currency = lastPart
-    name = parts.slice(0, -1).join(' ')
+// Register all @mentioned users (real LINE userIds) as members of a trip.
+// Returns the resolved {id, name} pairs (deduped, excluding alreadySeen ids).
+async function registerMentionees(
+  tripId: string, groupId: string, mentionees: string[], alreadySeen: Set<string>
+): Promise<Array<{ id: string; name: string }>> {
+  const added: Array<{ id: string; name: string }> = []
+  for (const uid of mentionees) {
+    if (alreadySeen.has(uid)) continue
+    alreadySeen.add(uid)
+    const prof = await getGroupMemberProfile(groupId, uid)
+    const memberName = prof?.displayName ?? uid
+    await ensureMember(tripId, uid, memberName)
+    added.push({ id: uid, name: memberName })
   }
+  return added
+}
+
+async function handleNewTrip(
+  groupId: string, userId: string, displayName: string,
+  text: string, mentionees: string[]
+): Promise<BotReply> {
+  const raw = text.replace(/^(新增旅程|開始分帳)\s*/, '').trim()
+  if (!raw) return { text: '請輸入旅程名稱，例如：新增旅程 沖繩 @小明 @阿華' }
+
+  // Trip name / currency is the part before the first @mention
+  const beforeMentions = raw.split('@')[0].trim()
+  const nameParts = beforeMentions.split(/\s+/).filter(Boolean)
+  let currency = 'TWD'
+  let name = beforeMentions
+  if (nameParts.length > 1 && isCurrency(nameParts[nameParts.length - 1].toUpperCase())) {
+    currency = nameParts[nameParts.length - 1].toUpperCase()
+    name = nameParts.slice(0, -1).join(' ')
+  }
+  if (!name) name = '旅程'
 
   const { data, error } = await supabase
     .from('trips')
@@ -160,13 +187,47 @@ async function handleNewTrip(groupId: string, userId: string, displayName: strin
 
   if (error || !data) return { text: '建立旅程失敗，請稍後再試' }
 
-  // Run sync in background so trip creation response is fast
-  syncGroupMembers(groupId, data.id).catch(() => null)
+  // Build roster: creator first, then everyone @mentioned (real LINE userIds)
+  const seen = new Set<string>([userId])
+  await ensureMember(data.id, userId, displayName)
+  const roster: Array<{ id: string; name: string }> = [{ id: userId, name: displayName }]
+  const added = await registerMentionees(data.id, groupId, mentionees, seen)
+  roster.push(...added)
 
+  // No @mentions — try legacy auto-sync (only works on verified/premium accounts)
+  if (mentionees.length === 0) {
+    syncGroupMembers(groupId, data.id).catch(() => null)
+  }
+
+  const dupes = buildDupeSet(roster)
+  const rosterText = roster.map(m => tagName(m.id, m.name, dupes)).join('、')
   const currencyNote = currency !== 'TWD' ? `\n💱 預設貨幣：${currency}（結算自動換算為 TWD）` : ''
+  const memberNote = mentionees.length > 0
+    ? `\n👥 成員（${roster.length}）：${rosterText}`
+    : `\n👥 尚未設定其他成員\n請用「成員 @A @B」加入一起分帳的人`
+
   return {
-    text: `✅ 已建立旅程：${data.name}${currencyNote}\n👥 正在同步群組成員...`,
+    text: `✅ 已建立旅程：${data.name}${currencyNote}${memberNote}`,
     quickReply: QR_NEW_TRIP,
+  }
+}
+
+async function handleAddMembers(groupId: string, mentionees: string[]): Promise<BotReply> {
+  const trip = await getActiveTrip(groupId)
+  if (!trip) return { text: '目前沒有進行中的旅程，請先「新增旅程」' }
+  if (mentionees.length === 0) return { text: '請 @ 要加入的成員，例如：成員 @小明 @阿華' }
+
+  await registerMentionees(trip.id, groupId, mentionees, new Set<string>())
+
+  const { data: members } = await supabase
+    .from('trip_members').select('user_line_id, user_name').eq('trip_id', trip.id)
+  const roster = (members ?? []).map(m => ({ id: m.user_line_id, name: m.user_name }))
+  const dupes = buildDupeSet(roster)
+  const rosterText = roster.map(m => tagName(m.id, m.name, dupes)).join('、')
+
+  return {
+    text: `✅ 已更新成員\n👥 目前成員（${roster.length}）：${rosterText}`,
+    quickReply: QR_MAIN,
   }
 }
 
@@ -207,7 +268,7 @@ async function getTripMembers(tripId: string, groupId: string) {
   const { data } = await supabase
     .from('trip_members').select('user_line_id, user_name').eq('trip_id', tripId)
   if (data && data.length > 0) return data
-  // Background sync hasn't finished yet — run inline now
+  // No roster yet — attempt legacy auto-sync (verified accounts only)
   await syncGroupMembers(groupId, tripId)
   const fresh = await supabase
     .from('trip_members').select('user_line_id, user_name').eq('trip_id', tripId)
@@ -446,7 +507,7 @@ async function handleEndTrip(groupId: string): Promise<BotReply> {
   const { error } = await supabase.from('trips').update({ status: 'settled' }).eq('id', trip.id)
   if (error) return { text: '結束旅程失敗，請稍後再試' }
   return {
-    text: `🏁 旅程「${trip.name}」已結束\n\n輸入「新增旅程 名稱」可以開始新的分帳`,
+    text: `🏁 旅程「${trip.name}」已結束\n\n輸入「新增旅程 名稱 @成員」可以開始新的分帳`,
     quickReply: QR_NEW_AFTER_END,
   }
 }
@@ -481,11 +542,15 @@ const FORMAT_ERROR = `格式錯誤，請參考：
 
 const HELP_TEXT = `📖 分帳機器人指令
 
-🆕 新增旅程 [名稱] [貨幣]
-   例：新增旅程 沖繩 JPY
+🆕 新增旅程 [名稱] [貨幣] @成員...
+   例：新增旅程 沖繩 JPY @小明 @阿華
+   （建立時 @ 到所有一起分帳的人）
+
+👥 成員 @A @B
+   中途補加成員
 
 💰 記帳 [金額] [貨幣] [說明]
-   例：記帳 5000 JPY 晚餐
+   例：記帳 5000 JPY 晚餐（預設全員均分）
 
 👨 幫[NAME]記帳 [金額] [說明]
    [NAME]付了 [金額] [說明]
