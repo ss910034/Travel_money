@@ -33,6 +33,17 @@ export interface Expense {
   splits: ExpenseSplit[]
 }
 
+export interface Payment {
+  id: string
+  tripId: string
+  fromLineId: string
+  fromName: string
+  toLineId: string
+  toName: string
+  amount: number
+  createdAt: string
+}
+
 export interface Settlement {
   from: string
   fromName: string

@@ -1,6 +1,6 @@
-import type { Expense, Settlement } from '@/types'
+import type { Expense, Payment, Settlement } from '@/types'
 
-export function calculateSettlement(expenses: Expense[]): Settlement[] {
+export function calculateSettlement(expenses: Expense[], payments: Payment[] = []): Settlement[] {
   const balances: Record<string, { name: string; amount: number }> = {}
 
   for (const expense of expenses) {
@@ -15,6 +15,14 @@ export function calculateSettlement(expenses: Expense[]): Settlement[] {
       }
       balances[split.userLineId].amount -= split.amount
     }
+  }
+
+  // A repayment from A to B reduces A's debt: A's balance rises, B's falls.
+  for (const p of payments) {
+    if (!balances[p.fromLineId]) balances[p.fromLineId] = { name: p.fromName, amount: 0 }
+    if (!balances[p.toLineId]) balances[p.toLineId] = { name: p.toName, amount: 0 }
+    balances[p.fromLineId].amount += p.amount
+    balances[p.toLineId].amount -= p.amount
   }
 
   const creditors = Object.entries(balances)
@@ -51,5 +59,5 @@ export function calculateSettlement(expenses: Expense[]): Settlement[] {
     if (Math.abs(debtors[j].amount) < 0.01) j++
   }
 
-  return transactions
+  return transactions.filter(t => t.amount > 0)
 }
