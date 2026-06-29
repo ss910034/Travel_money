@@ -47,8 +47,40 @@ CREATE TABLE expense_splits (
   amount NUMERIC(10,2) NOT NULL
 );
 
+-- Repayments (who has paid whom back, applied on top of settlement)
+CREATE TABLE payments (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  trip_id UUID REFERENCES trips(id) ON DELETE CASCADE,
+  from_line_id TEXT NOT NULL,
+  from_name TEXT,
+  to_line_id TEXT NOT NULL,
+  to_name TEXT,
+  amount NUMERIC(10,2) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX idx_trips_group ON trips(line_group_id, status);
 CREATE INDEX idx_expenses_trip ON expenses(trip_id);
 CREATE INDEX idx_splits_expense ON expense_splits(expense_id);
 CREATE INDEX idx_members_trip ON trip_members(trip_id);
+CREATE INDEX idx_payments_trip ON payments(trip_id);
+
+-- ============================================================
+-- Migration for existing databases (run these if the tables
+-- above already exist). Safe to run repeatedly.
+-- ============================================================
+-- ALTER TABLE trips    ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'TWD';
+-- ALTER TABLE expenses ADD COLUMN IF NOT EXISTS original_amount NUMERIC(10,2);
+-- ALTER TABLE expenses ADD COLUMN IF NOT EXISTS original_currency TEXT;
+-- CREATE TABLE IF NOT EXISTS payments (
+--   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--   trip_id UUID REFERENCES trips(id) ON DELETE CASCADE,
+--   from_line_id TEXT NOT NULL,
+--   from_name TEXT,
+--   to_line_id TEXT NOT NULL,
+--   to_name TEXT,
+--   amount NUMERIC(10,2) NOT NULL,
+--   created_at TIMESTAMPTZ DEFAULT NOW()
+-- );
+-- CREATE INDEX IF NOT EXISTS idx_payments_trip ON payments(trip_id);
